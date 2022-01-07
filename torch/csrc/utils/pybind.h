@@ -24,6 +24,9 @@ namespace py = pybind11;
 // https://pybind11.readthedocs.io/en/stable/advanced/smart_ptrs.html#custom-smart-pointers
 PYBIND11_DECLARE_HOLDER_TYPE(T, c10::intrusive_ptr<T>, true);
 
+PYBIND11_DECLARE_HOLDER_TYPE(T, c10::SingletonOrSharedTypePtr<T>);
+PYBIND11_DECLARE_HOLDER_TYPE(T, c10::SingletonTypePtr<T>, true);
+
 namespace pybind11 { namespace detail {
 
 // torch.Tensor <-> at::Tensor conversions (without unwrapping)
@@ -45,6 +48,32 @@ struct type_caster<at::Tensor> {
   static handle
   cast(const at::Tensor& src, return_value_policy /* policy */, handle /* parent */) {
     return handle(THPVariable_Wrap(src));
+  }
+};
+
+// torch._StorageBase <-> at::Storage
+template <>
+struct type_caster<at::Storage> {
+ public:
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
+  PYBIND11_TYPE_CASTER(at::Storage, _("at::Storage"));
+
+  bool load(handle src, bool) {
+    PyObject* obj = src.ptr();
+    if (torch::isStorage(obj)) {
+      value = torch::createStorage(obj);
+      return true;
+    }
+    return false;
+  }
+
+  static handle
+  cast(const at::Storage& src, return_value_policy /* policy */, handle /* parent */) {
+    TORCH_CHECK(
+        false,
+        "NotImplementedError: pybind conversion of at::Storages from C++ to python not supported.");
+    // Storages are untyped, see: https://github.com/pytorch/pytorch/issues/47442
+    return handle(torch::createPyObject(src, caffe2::TypeMeta()));
   }
 };
 

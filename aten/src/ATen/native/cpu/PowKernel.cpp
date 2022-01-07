@@ -1,3 +1,4 @@
+#define TORCH_ASSERT_NO_OPERATORS
 #include <cmath>
 #include <ATen/Dispatch.h>
 #include <ATen/Parallel.h>
@@ -6,9 +7,11 @@
 #include <ATen/native/Pow.h>
 #include <ATen/native/cpu/Loops.h>
 
+#include <c10/core/Scalar.h>
+
 namespace at { namespace native {
 
-namespace CPU_CAPABILITY {
+inline namespace CPU_CAPABILITY {
 
 void pow_tensor_tensor_kernel(TensorIteratorBase& iter) {
   const auto dtype = iter.common_dtype();
@@ -145,9 +148,7 @@ void pow_tensor_scalar_kernel(
 
 } // anonymous namespace
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 REGISTER_DISPATCH(pow_tensor_tensor_stub, &CPU_CAPABILITY::pow_tensor_tensor_kernel);
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 REGISTER_DISPATCH(pow_tensor_scalar_stub, &CPU_CAPABILITY::pow_tensor_scalar_kernel);
 
 }} // namespace at::native

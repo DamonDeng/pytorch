@@ -170,8 +170,8 @@ void Softmax2dImpl::pretty_print(std::ostream& stream) const {
 }
 
 Tensor Softmax2dImpl::forward(const Tensor& input) {
-  TORCH_CHECK(input.dim() == 4, "Softmax2d requires a 4D tensor as input");
-  return F::detail::softmax(input, /*dim=*/1, c10::nullopt);
+  TORCH_CHECK(input.dim() == 4 || input.dim() == 3, "Softmax2d requires a 3D or 4D tensor as input");
+  return F::detail::softmax(input, /*dim=*/-3, c10::nullopt);
 }
 
 // ============================================================================
@@ -429,7 +429,8 @@ MultiheadAttentionImpl::MultiheadAttentionImpl(const MultiheadAttentionOptions& 
 std::tuple<Tensor, Tensor> MultiheadAttentionImpl::forward(
   const Tensor& query, const Tensor& key,
   const Tensor& value, const Tensor& key_padding_mask,
-  bool need_weights, const Tensor& attn_mask) {
+  bool need_weights, const Tensor& attn_mask,
+  bool average_attn_weights) {
   if (!_qkv_same_embed_dim) {
     return F::multi_head_attention_forward(
       query, key, value,
@@ -452,6 +453,7 @@ std::tuple<Tensor, Tensor> MultiheadAttentionImpl::forward(
        .q_proj_weight(q_proj_weight)
        .k_proj_weight(k_proj_weight)
        .v_proj_weight(v_proj_weight)
+       .average_attn_weights(average_attn_weights)
     );
   } else {
     return F::multi_head_attention_forward(
@@ -471,6 +473,7 @@ std::tuple<Tensor, Tensor> MultiheadAttentionImpl::forward(
        .key_padding_mask(key_padding_mask)
        .need_weights(need_weights)
        .attn_mask(attn_mask)
+       .average_attn_weights(average_attn_weights)
     );
   }
 }
@@ -511,8 +514,8 @@ void MultiheadAttentionImpl::reset() {
     bias_k = register_parameter("bias_k", torch::empty({1, 1, options.embed_dim()}));
     bias_v = register_parameter("bias_v", torch::empty({1, 1, options.embed_dim()}));
   } else {
-    bias_k = {};
-    bias_v = {};
+    bias_k.reset();
+    bias_v.reset();
   }
   _reset_parameters();
 }

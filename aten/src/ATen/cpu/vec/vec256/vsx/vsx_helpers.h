@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <c10/macros/Macros.h>
-#include <ATen/cpu/vec/vec256/intrinsics.h>
+#include <ATen/cpu/vec/intrinsics.h>
 
 using vbool8   =  __attribute__((altivec(vector__))) __attribute__((altivec(bool__))) char;
 using vbool16  =  __attribute__((altivec(vector__))) __attribute__((altivec(bool__))) short;
@@ -342,8 +342,8 @@ constexpr vbool64 VsxComplexDblMask2(uint32_t mask) {
 // constants
 namespace at {
 namespace vec {
-// See Note [Acceptable use of anonymous namespace in header]
-namespace {
+// See Note [CPU_CAPABILITY namespace]
+inline namespace CPU_CAPABILITY {
 //
 constexpr int offset0 = 0;
 constexpr int offset16 = 16;

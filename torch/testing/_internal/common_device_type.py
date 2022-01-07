@@ -6,16 +6,19 @@ import threading
 from collections import namedtuple
 from enum import Enum
 from functools import wraps
-from typing import List, Any, ClassVar, Optional, Sequence, Tuple
+from typing import List, Any, ClassVar, Optional, Sequence, Tuple, Union, Dict, Set
 import unittest
 import os
 import torch
 from torch.testing._internal.common_utils import TestCase, TEST_WITH_ROCM, TEST_MKL, \
     skipCUDANonDefaultStreamIf, TEST_WITH_ASAN, TEST_WITH_UBSAN, TEST_WITH_TSAN, \
-    IS_SANDCASTLE, IS_FBCODE, IS_REMOTE_GPU, DeterministicGuard, TEST_SKIP_NOARCH
-from torch.testing._internal.common_cuda import _get_torch_cuda_version
-from torch.testing import \
-    (get_all_dtypes)
+    IS_SANDCASTLE, IS_FBCODE, IS_REMOTE_GPU, IS_WINDOWS, DeterministicGuard, TEST_SKIP_NOARCH, \
+    _TestParametrizer, compose_parametrize_fns, dtype_name, TEST_WITH_MIOPEN_SUGGEST_NHWC, NATIVE_DEVICES
+from torch.testing._internal.common_cuda import _get_torch_cuda_version, TEST_CUSPARSE_GENERIC
+from torch.testing._internal.common_dtype import get_all_dtypes
+
+# The implementation should be moved here as soon as the deprecation period is over.
+from torch.testing._legacy import get_all_device_types  # noqa: F401
 
 try:
     import psutil  # type: ignore[import]
@@ -50,7 +53,7 @@ except ImportError:
 #
 # This framework was built to make it easier to write tests that run on
 #   multiple device types, multiple datatypes (dtypes), and for multiple
-#   operators. It's also useful for controlling which tests are fun. For example,
+#   operators. It's also useful for controlling which tests are run. For example,
 #   only tests that use a CUDA device can be run on platforms with CUDA.
 #   Let's dive in with an example to get an idea for how it works:
 #
@@ -187,8 +190,8 @@ except ImportError:
 #         In addition to accepting multiple dtypes, the @dtypes decorator
 #         can accept a sequence of tuple pairs of dtypes. The test template
 #         will be called with each tuple for its "dtype" argument.
-#     - @onlyOnCPUAndCUDA
-#         Skips the test if the device is not a CPU or CUDA device
+#     - @onlyNativeDeviceTypes
+#         Skips the test if the device is not a native device type (currently CPU, CUDA, Meta)
 #     - @onlyCPU
 #         Skips the test if the device is not a CPU device
 #     - @onlyCUDA
@@ -252,27 +255,27 @@ except ImportError:
 # then inherit from it for your generic test.
 
 
-def _construct_test_name(test_name, op, device_type, dtype):
-    if op is not None:
-        test_name += "_" + op.name.replace('.', '_')
-        if op.variant_test_name:
-            test_name += "_" + op.variant_test_name
-
-    test_name += "_" + device_type
-
-    if dtype is not None and dtype is not _NO_DTYPES:
-        if isinstance(dtype, (list, tuple)):
-            for d in dtype:
-                test_name += "_" + str(d).split('.')[1]
-        else:
-            test_name += "_" + str(dtype).split('.')[1]
-
-    return test_name
+def _dtype_test_suffix(dtypes):
+    """ Returns the test suffix for a dtype, sequence of dtypes, or None. """
+    if isinstance(dtypes, list) or isinstance(dtypes, tuple):
+        if len(dtypes) == 0:
+            return ''
+        return '_' + '_'.join((dtype_name(d) for d in dtypes))
+    elif dtypes:
+        return '_{}'.format(dtype_name(dtypes))
+    else:
+        return ''
 
 
-# Marker class to signify an absense of dtypes
-class _NO_DTYPES(object):
-    pass
+def _update_param_kwargs(param_kwargs, name, value):
+    """ Adds a kwarg with the specified name and value to the param_kwargs dict. """
+    if isinstance(value, list) or isinstance(value, tuple):
+        # Make name plural (e.g. devices / dtypes) if the value is composite.
+        param_kwargs['{}s'.format(name)] = value
+    elif value:
+        param_kwargs[name] = value
+
+    # Leave param_kwargs as-is when value is None.
 
 
 class DeviceTypeTestBase(TestCase):
@@ -323,7 +326,12 @@ class DeviceTypeTestBase(TestCase):
     def _get_dtypes(cls, test):
         if not hasattr(test, 'dtypes'):
             return None
-        return test.dtypes.get(cls.device_type, test.dtypes.get('all', None))
+
+        default_dtypes = test.dtypes.get('all')
+        msg = f"@dtypes is mandatory when using @dtypesIf however '{test.__name__}' didn't specify it"
+        assert default_dtypes is not None, msg
+
+        return test.dtypes.get(cls.device_type, default_dtypes)
 
     def _get_precision_override(self, test, dtype):
         if not hasattr(test, 'precision_overrides'):
@@ -335,66 +343,37 @@ class DeviceTypeTestBase(TestCase):
             return self.precision, self.rel_tol
         return test.tolerance_overrides.get(dtype, tol(self.precision, self.rel_tol))
 
+    def _apply_precision_override_for_test(self, test, param_kwargs):
+        dtype = param_kwargs['dtype'] if 'dtype' in param_kwargs else None
+        dtype = param_kwargs['dtypes'] if 'dtypes' in param_kwargs else dtype
+        if dtype:
+            self.precision = self._get_precision_override(test, dtype)
+            self.precision, self.rel_tol = self._get_tolerance_override(test, dtype)
+
     # Creates device-specific tests.
     @classmethod
     def instantiate_test(cls, name, test, *, generic_cls=None):
 
-        def instantiate_test_helper(cls, name, *, test, dtype, op):
-
-            # Constructs the test's name
-            test_name = _construct_test_name(name, op, cls.device_type, dtype)
-
-            # Wraps instantiated test with op decorators
-            # NOTE: test_wrapper exists because we don't want to apply
-            #   op-specific decorators to the original test.
-            #   Test-specific decorators are applied to the original test,
-            #   however.
-            if op is not None:
-                try:
-                    active_decorators = []
-                    if op.should_skip(generic_cls.__name__, name, cls.device_type, dtype):
-                        active_decorators.append(skipIf(True, "Skipped!"))
-
-                    if op.decorators is not None:
-                        for decorator in op.decorators:
-                            # Can't use isinstance as it would cause a circular import
-                            if decorator.__class__.__name__ == 'DecorateInfo':
-                                if decorator.is_active(generic_cls.__name__, name, cls.device_type, dtype):
-                                    active_decorators += decorator.decorators
-                            else:
-                                active_decorators.append(decorator)
-
-                    @wraps(test)
-                    def test_wrapper(*args, **kwargs):
-                        return test(*args, **kwargs)
-
-                    for decorator in active_decorators:
-                        test_wrapper = decorator(test_wrapper)
-
-                    test_fn = test_wrapper
-                except Exception as ex:
-                    # Provides an error message for debugging before rethrowing the exception
-                    print("Failed to instantiate {0} for op {1}!".format(test_name, op.name))
-                    raise ex
-            else:
-                test_fn = test
-
+        def instantiate_test_helper(cls, name, *, test, param_kwargs=None):
             # Constructs the test
-            @wraps(test_fn)
-            def instantiated_test(self, name=name, test=test_fn, dtype=dtype, op=op):
-                device_arg: str = cls.get_primary_device()
-                if hasattr(test_fn, 'num_required_devices'):
-                    device_arg = cls.get_all_devices()
+            @wraps(test)
+            def instantiated_test(self, param_kwargs=param_kwargs):
+                # Add the device param kwarg if the test needs device or devices.
+                param_kwargs = {} if param_kwargs is None else param_kwargs
+                test_sig_params = inspect.signature(test).parameters
+                if 'device' in test_sig_params or 'devices' in test_sig_params:
+                    device_arg: str = cls.get_primary_device()
+                    if hasattr(test, 'num_required_devices'):
+                        device_arg = cls.get_all_devices()
+                    _update_param_kwargs(param_kwargs, 'device', device_arg)
 
                 # Sets precision and runs test
                 # Note: precision is reset after the test is run
                 guard_precision = self.precision
                 guard_rel_tol = self.rel_tol
                 try:
-                    self.precision = self._get_precision_override(test_fn, dtype)
-                    self.precision, self.rel_tol = self._get_tolerance_override(test_fn, dtype)
-                    args = (arg for arg in (device_arg, dtype, op) if arg is not None)
-                    result = test_fn(self, *args)
+                    self._apply_precision_override_for_test(test, param_kwargs)
+                    result = test(self, **param_kwargs)
                 except RuntimeError as rte:
                     # check if rte should stop entire test suite.
                     self._stop_test_suite = self._should_stop_test_suite()
@@ -406,55 +385,44 @@ class DeviceTypeTestBase(TestCase):
 
                 return result
 
-            assert not hasattr(cls, test_name), "Redefinition of test {0}".format(test_name)
-            setattr(cls, test_name, instantiated_test)
+            assert not hasattr(cls, name), "Redefinition of test {0}".format(name)
+            setattr(cls, name, instantiated_test)
 
-        # Handles tests using the ops decorator
-        if hasattr(test, "op_list"):
-            for op in test.op_list:
-                # Acquires dtypes, using the op data if unspecified
-                dtypes = cls._get_dtypes(test)
-                if dtypes is None:
-                    if test.opinfo_dtypes == OpDTypes.unsupported_backward:
-                        dtypes = set(get_all_dtypes()).difference(op.supported_backward_dtypes(cls.device_type))
-                    elif test.opinfo_dtypes == OpDTypes.supported_backward:
-                        dtypes = op.supported_backward_dtypes(cls.device_type)
-                    elif test.opinfo_dtypes == OpDTypes.unsupported:
-                        dtypes = set(get_all_dtypes()).difference(op.supported_dtypes(cls.device_type))
-                    elif test.opinfo_dtypes == OpDTypes.supported:
-                        dtypes = op.supported_dtypes(cls.device_type)
-                    elif test.opinfo_dtypes == OpDTypes.basic:
-                        dtypes = op.default_test_dtypes(cls.device_type)
-                    elif test.opinfo_dtypes == OpDTypes.none:
-                        dtypes = _NO_DTYPES
-                    else:
-                        raise RuntimeError(f"Unknown OpDType: {test.opinfo_dtypes}")
+        def default_parametrize_fn(test, generic_cls, device_cls):
+            # By default, no parametrization is needed.
+            yield (test, '', {})
 
-                    if test.allowed_dtypes is not None:
-                        dtypes = dtypes.intersection(test.allowed_dtypes)
-                else:
-                    assert test.allowed_dtypes is None, "ops(allowed_dtypes=[...]) and the dtypes decorator are incompatible"
-                    assert test.opinfo_dtypes == OpDTypes.basic, "ops(dtypes=...) and the dtypes decorator are incompatible"
+        # Parametrization decorators set the parametrize_fn attribute on the test.
+        parametrize_fn = test.parametrize_fn if hasattr(test, 'parametrize_fn') else default_parametrize_fn
 
-                if dtypes is _NO_DTYPES:
-                    instantiate_test_helper(cls,
-                                            name,
-                                            test=test,
-                                            dtype=_NO_DTYPES,
-                                            op=op)
-                else:
-                    for dtype in dtypes:
-                        instantiate_test_helper(cls,
-                                                name,
-                                                test=test,
-                                                dtype=dtype,
-                                                op=op)
-        else:
-            # Handles tests that don't use the ops decorator
-            dtypes = cls._get_dtypes(test)
-            dtypes = tuple(dtypes) if dtypes is not None else (None,)
-            for dtype in dtypes:
-                instantiate_test_helper(cls, name, test=test, dtype=dtype, op=None)
+        # If one of the @dtypes* decorators is present, also parametrize over the dtypes set by it.
+        dtypes = cls._get_dtypes(test)
+        if dtypes is not None:
+
+            def dtype_parametrize_fn(test, generic_cls, device_cls, dtypes=dtypes):
+                for dtype in dtypes:
+                    param_kwargs: Dict[str, Any] = {}
+                    _update_param_kwargs(param_kwargs, "dtype", dtype)
+
+                    # Note that an empty test suffix is set here so that the dtype can be appended
+                    # later after the device.
+                    yield (test, '', param_kwargs)
+
+            parametrize_fn = compose_parametrize_fns(dtype_parametrize_fn, parametrize_fn)
+
+        # Instantiate the parametrized tests.
+        for (test, test_suffix, param_kwargs) in parametrize_fn(test, generic_cls, cls):
+            test_suffix = '' if test_suffix == '' else '_' + test_suffix
+            device_suffix = '_' + cls.device_type
+
+            # Note: device and dtype suffix placement
+            # Special handling here to place dtype(s) after device according to test name convention.
+            dtype_kwarg = None
+            if 'dtype' in param_kwargs or 'dtypes' in param_kwargs:
+                dtype_kwarg = param_kwargs['dtypes'] if 'dtypes' in param_kwargs else param_kwargs['dtype']
+            test_name = '{}{}{}{}'.format(name, test_suffix, device_suffix, _dtype_test_suffix(dtype_kwarg))
+
+            instantiate_test_helper(cls=cls, name=test_name, test=test, param_kwargs=param_kwargs)
 
     def run(self, result=None):
         super().run(result=result)
@@ -671,20 +639,24 @@ def instantiate_device_type_tests(generic_test_class, scope, except_for=None, on
 # Category of dtypes to run an OpInfo-based test for
 # Example use: @ops(dtype=OpDTypes.supported)
 #
-# There are 3 categories: supported, unsupported and basic.
+# There are 6 categories:
 # - basic: The dtypes the operator wants to be tested on by default. This will be
 #          a subset of the types supported by the operator.
 # - supported: Every dtype supported by the operator. Use for exhaustive
 #              testing of all dtypes.
 # - unsupported: Run tests on dtypes not supported by the operator. e.g. for
 #                testing the operator raises an error and doesn't crash.
+# - supported_backward: Every dtype supported by the operator's backward pass.
+# - unsupported_backward: Run tests on dtypes not supported by the operator's backward pass.
+# - none: Useful for tests that are not dtype-specific. No dtype will be passed to the test
+#         when this is selected.
 class OpDTypes(Enum):
     basic = 0  # Test the basic set of dtypes (default)
     supported = 1  # Test all supported dtypes
     unsupported = 2  # Test only unsupported dtypes
     supported_backward = 3  # Test all supported backward dtypes
     unsupported_backward = 4  # Test only unsupported backward dtypes
-    none = 5  # Instantiate no dtype variants (the dtype kwarg will be None)
+    none = 5  # Instantiate no dtype variants (no dtype kwarg needed)
 
 
 # Decorator that defines the OpInfos a test template should be instantiated for.
@@ -718,25 +690,77 @@ class OpDTypes(Enum):
 #     operator's gradient formula supports
 #   OpDTypes.unsupported_backward - the test is instantiated for all dtypes the
 #     operator's gradient formula doesn't support
-#   OpDTypes.none - the test is instantied without any dtype. The dtype
-#     arg will be set to _NO_DTYPES.
+#   OpDTypes.none - the test is instantied without any dtype. The test signature
+#     should not include a dtype kwarg in this case.
 #
 # These options allow tests to have considerable control over the dtypes
-#   they're instantiated for. Finally, the @dtypes decorator composes with the
-#   @ops decorator, and works the same as the "dtypes" argument to @ops.
+#   they're instantiated for.
 
-class ops(object):
-    def __init__(self, op_list, *, dtypes: OpDTypes = OpDTypes.basic,
+class ops(_TestParametrizer):
+    def __init__(self, op_list, *, dtypes: Union[OpDTypes, Sequence[torch.dtype]] = OpDTypes.basic,
                  allowed_dtypes: Optional[Sequence[torch.dtype]] = None):
         self.op_list = op_list
         self.opinfo_dtypes = dtypes
         self.allowed_dtypes = set(allowed_dtypes) if allowed_dtypes is not None else None
 
-    def __call__(self, fn):
-        fn.op_list = self.op_list
-        fn.allowed_dtypes = self.allowed_dtypes
-        fn.opinfo_dtypes = self.opinfo_dtypes
-        return fn
+    def _parametrize_test(self, test, generic_cls, device_cls):
+        """ Parameterizes the given test function across each op and its associated dtypes. """
+        if device_cls is None:
+            raise RuntimeError('The @ops decorator is only intended to be used in a device-specific '
+                               'context; use it with instantiate_device_type_tests() instead of '
+                               'instantiate_parametrized_tests()')
+
+        for op in self.op_list:
+            # Determine the set of dtypes to use.
+            dtypes: Union[Set[torch.dtype], Set[None]]
+            if isinstance(self.opinfo_dtypes, Sequence):
+                dtypes = set(self.opinfo_dtypes)
+            elif self.opinfo_dtypes == OpDTypes.unsupported_backward:
+                dtypes = set(get_all_dtypes()).difference(op.supported_backward_dtypes(device_cls.device_type))
+            elif self.opinfo_dtypes == OpDTypes.supported_backward:
+                dtypes = op.supported_backward_dtypes(device_cls.device_type)
+            elif self.opinfo_dtypes == OpDTypes.unsupported:
+                dtypes = set(get_all_dtypes()).difference(op.supported_dtypes(device_cls.device_type))
+            elif self.opinfo_dtypes == OpDTypes.supported:
+                dtypes = op.supported_dtypes(device_cls.device_type)
+            elif self.opinfo_dtypes == OpDTypes.basic:
+                dtypes = op.default_test_dtypes(device_cls.device_type)
+            elif self.opinfo_dtypes == OpDTypes.none:
+                dtypes = {None}
+            else:
+                raise RuntimeError(f"Unknown OpDType: {self.opinfo_dtypes}")
+
+            if self.allowed_dtypes is not None:
+                dtypes = dtypes.intersection(self.allowed_dtypes)
+
+            # Construct the test name; device / dtype parts are handled outside.
+            # See [Note: device and dtype suffix placement]
+            test_name = op.formatted_name
+
+            for dtype in dtypes:
+                # Construct parameter kwargs to pass to the test.
+                param_kwargs = {'op': op}
+                _update_param_kwargs(param_kwargs, 'dtype', dtype)
+
+                # Wraps instantiated test with op decorators
+                # NOTE: test_wrapper exists because we don't want to apply
+                #   op-specific decorators to the original test.
+                #   Test-specific decorators are applied to the original test,
+                #   however.
+                try:
+                    @wraps(test)
+                    def test_wrapper(*args, **kwargs):
+                        return test(*args, **kwargs)
+
+                    for decorator in op.get_decorators(
+                            generic_cls.__name__, test.__name__, device_cls.device_type, dtype):
+                        test_wrapper = decorator(test_wrapper)
+
+                    yield (test_wrapper, test_name, param_kwargs)
+                except Exception as ex:
+                    # Provides an error message for debugging before rethrowing the exception
+                    print("Failed to instantiate {0} for op {1}!".format(test_name, op.name))
+                    raise ex
 
 # Decorator that skips a test if the given condition is true.
 # Notes:
@@ -756,12 +780,12 @@ class skipIf(object):
     def __call__(self, fn):
 
         @wraps(fn)
-        def dep_fn(slf, device, *args, **kwargs):
+        def dep_fn(slf, *args, **kwargs):
             if self.device_type is None or self.device_type == slf.device_type:
                 if (isinstance(self.dep, str) and getattr(slf, self.dep, True)) or (isinstance(self.dep, bool) and self.dep):
                     raise unittest.SkipTest(self.reason)
 
-            return fn(slf, device, *args, **kwargs)
+            return fn(slf, *args, **kwargs)
         return dep_fn
 
 
@@ -783,6 +807,13 @@ class skipMetaIf(skipIf):
 
     def __init__(self, dep, reason):
         super().__init__(dep, reason, device_type='meta')
+
+# Skips a test on XLA if the condition is true.
+class skipXLAIf(skipIf):
+
+    def __init__(self, dep, reason):
+        super().__init__(dep, reason, device_type='xla')
+
 
 def _has_sufficient_memory(device, size):
     if torch.device(device).type == 'cuda':
@@ -847,16 +878,16 @@ class expectedFailure(object):
     def __call__(self, fn):
 
         @wraps(fn)
-        def efail_fn(slf, device, *args, **kwargs):
+        def efail_fn(slf, *args, **kwargs):
             if self.device_type is None or self.device_type == slf.device_type:
                 try:
-                    fn(slf, device, *args, **kwargs)
+                    fn(slf, *args, **kwargs)
                 except Exception:
                     return
                 else:
                     slf.fail('expected test to fail, but it passed')
 
-            return fn(slf, device, *args, **kwargs)
+            return fn(slf, *args, **kwargs)
         return efail_fn
 
 
@@ -868,12 +899,12 @@ class onlyOn(object):
     def __call__(self, fn):
 
         @wraps(fn)
-        def only_fn(slf, device, *args, **kwargs):
+        def only_fn(slf, *args, **kwargs):
             if self.device_type != slf.device_type:
                 reason = "Only runs on {0}".format(self.device_type)
                 raise unittest.SkipTest(reason)
 
-            return fn(slf, device, *args, **kwargs)
+            return fn(slf, *args, **kwargs)
 
         return only_fn
 
@@ -901,15 +932,15 @@ class deviceCountAtLeast(object):
 
         return multi_fn
 
-# Only runs the test on the CPU and CUDA (the native device types)
-def onlyOnCPUAndCUDA(fn):
+# Only runs the test on the native device type (currently CPU, CUDA, Meta)
+def onlyNativeDeviceTypes(fn):
     @wraps(fn)
-    def only_fn(self, device, *args, **kwargs):
-        if self.device_type != 'cpu' and self.device_type != 'cuda':
-            reason = "onlyOnCPUAndCUDA: doesn't run on {0}".format(self.device_type)
+    def only_fn(self, *args, **kwargs):
+        if self.device_type not in NATIVE_DEVICES:
+            reason = "onlyNativeDeviceTypes: doesn't run on {0}".format(self.device_type)
             raise unittest.SkipTest(reason)
 
-        return fn(self, device, *args, **kwargs)
+        return fn(self, *args, **kwargs)
 
     return only_fn
 
@@ -1031,67 +1062,105 @@ def onlyCUDA(fn):
     return onlyOn('cuda')(fn)
 
 
+def disablecuDNN(fn):
+
+    @wraps(fn)
+    def disable_cudnn(self, *args, **kwargs):
+        if self.device_type == 'cuda' and self.has_cudnn():
+            with torch.backends.cudnn.flags(enabled=False):
+                return fn(self, *args, **kwargs)
+        return fn(self, *args, **kwargs)
+
+    return disable_cudnn
+
+def disableMkldnn(fn):
+
+    @wraps(fn)
+    def disable_mkldnn(self, *args, **kwargs):
+        if torch.backends.mkldnn.is_available():
+            with torch.backends.mkldnn.flags(enabled=False):
+                return fn(self, *args, **kwargs)
+        return fn(self, *args, **kwargs)
+
+    return disable_mkldnn
+
+
 def expectedFailureCUDA(fn):
     return expectedFailure('cuda')(fn)
 
 def expectedFailureMeta(fn):
     return expectedFailure('meta')(fn)
 
+def expectedFailureXLA(fn):
+    return expectedFailure('xla')(fn)
+
+# This decorator checks that the decorated function produces a nondeterministic
+# alert for the expected device types
 class expectedAlertNondeterministic:
-    def __init__(self, caller_name, device_type=None, fn_has_device_arg=True):
-        self.device_type = device_type
+    # Args:
+    #
+    #   caller_name (str): Name of the operation that produces the
+    #       nondeterministic alert. This name is expected to appear
+    #       in the error/warning message.
+    #
+    #   device_types (list[str], optional): If provided, the alert is
+    #       expected to only be triggered for the specified devices, and
+    #       no others. If None, then the alert is expected to be triggered
+    #       for all devices. Default: None
+    #
+    def __init__(self, caller_name, device_types=None):
+        if device_types is not None:
+            assert isinstance(device_types, list)
+            for device_type in device_types:
+                assert isinstance(device_type, str)
+        self.device_types = device_types
         self.error_message = caller_name + ' does not have a deterministic implementation, but you set'
-        self.fn_has_device_arg = fn_has_device_arg
 
     def __call__(self, fn):
         @wraps(fn)
         def efail_fn(slf, device, *args, **kwargs):
+            should_alert = self.device_types is None or slf.device_type in self.device_types
+
+            # Check that errors are thrown correctly
             with DeterministicGuard(True):
-                # If a nondeterministic error is expected for this case,
-                # check that it is raised
-                if self.device_type is None or self.device_type == slf.device_type:
+                if should_alert:
+                    with slf.assertRaisesRegex(
+                            RuntimeError,
+                            self.error_message,
+                            msg='expected a non-deterministic error, but it was not raised'):
+                        fn(slf, device, *args, **kwargs)
+
+                else:
+                    # If a nondeterministic error is not expected, make sure
+                    # that it is not raised
                     try:
-                        if self.fn_has_device_arg:
-                            fn(slf, device, *args, **kwargs)
-                        else:
-                            fn(slf, *args, **kwargs)
-                    except RuntimeError as e:
-                        if self.error_message not in str(e):
-                            slf.fail(
-                                'expected non-deterministic error message to start with "'
-                                + self.error_message
-                                + '" but got this instead: "' + str(e) + '"')
-                        return
-                    else:
-                        slf.fail('expected a non-deterministic error, but it was not raised')
-
-                # If a nondeterministic error is not expected for this case,
-                # make sure that it is not raised
-                try:
-                    if self.fn_has_device_arg:
                         return fn(slf, device, *args, **kwargs)
-                    else:
-                        return fn(slf, *args, **kwargs)
-                except RuntimeError as e:
-                    if 'does not have a deterministic implementation' in str(e):
-                        slf.fail(
-                            'did not expect non-deterministic error message, '
-                            + 'but got this: "' + str(e) + '"')
-                    # Reraise exceptions unrelated to nondeterminism
-                    raise
+                    except RuntimeError as e:
+                        if 'does not have a deterministic implementation' in str(e):
+                            slf.fail(
+                                'did not expect non-deterministic error message, '
+                                + 'but got one anyway: "' + str(e) + '"')
+                        # Reraise exceptions unrelated to nondeterminism
+                        raise
 
-        @wraps(fn)
-        def efail_fn_no_device(slf, *args, **kwargs):
-            return efail_fn(slf, None, *args, **kwargs)
+            # Check that warnings are thrown correctly
+            if should_alert:
+                with DeterministicGuard(True, warn_only=True):
+                    with slf.assertWarnsRegex(
+                            UserWarning,
+                            self.error_message):
+                        fn(slf, device, *args, **kwargs)
 
-        if self.fn_has_device_arg:
-            return efail_fn
-        else:
-            return efail_fn_no_device
+        return efail_fn
 
 # Skips a test on CPU if LAPACK is not available.
 def skipCPUIfNoLapack(fn):
     return skipCPUIf(not torch._C.has_lapack, "PyTorch compiled without Lapack")(fn)
+
+
+# Skips a test on CPU if FFT is not available.
+def skipCPUIfNoFFT(fn):
+    return skipCPUIf(not torch._C.has_spectral, "PyTorch is built without FFT support")(fn)
 
 
 # Skips a test on CPU if MKL is not available.
@@ -1099,19 +1168,32 @@ def skipCPUIfNoMkl(fn):
     return skipCPUIf(not TEST_MKL, "PyTorch is built without MKL support")(fn)
 
 
+# Skips a test on CPU if MKL Sparse is not available (it's not linked on Windows).
+def skipCPUIfNoMklSparse(fn):
+    return skipCPUIf(IS_WINDOWS or not TEST_MKL, "PyTorch is built without MKL support")(fn)
+
+
+# Skips a test on CPU if mkldnn is not available.
+def skipCPUIfNoMkldnn(fn):
+    return skipCPUIf(not torch.backends.mkldnn.is_available(), "PyTorch is built without mkldnn support")(fn)
+
+
 # Skips a test on CUDA if MAGMA is not available.
 def skipCUDAIfNoMagma(fn):
     return skipCUDAIf('no_magma', "no MAGMA library detected")(skipCUDANonDefaultStreamIf(True)(fn))
 
+def has_cusolver():
+    version = _get_torch_cuda_version()
+    # cuSolver is disabled on cuda < 10.1.243
+    return version >= (10, 2)
+
 # Skips a test on CUDA if cuSOLVER is not available
 def skipCUDAIfNoCusolver(fn):
-    version = _get_torch_cuda_version()
-    return skipCUDAIf(version < (10, 2), "cuSOLVER not available")(fn)
+    return skipCUDAIf(not has_cusolver(), "cuSOLVER not available")(fn)
 
 # Skips a test if both cuSOLVER and MAGMA are not available
 def skipCUDAIfNoMagmaAndNoCusolver(fn):
-    version = _get_torch_cuda_version()
-    if version >= (10, 2):
+    if has_cusolver():
         return fn
     else:
         # cuSolver is disabled on cuda < 10.1.243, tests depend on MAGMA
@@ -1124,6 +1206,32 @@ def skipCUDAIfRocm(fn):
 # Skips a test on CUDA when not using ROCm.
 def skipCUDAIfNotRocm(fn):
     return skipCUDAIf(not TEST_WITH_ROCM, "test doesn't currently work on the CUDA stack")(fn)
+
+# Skips a test on CUDA if ROCm is unavailable or its version is lower than requested.
+def skipCUDAIfRocmVersionLessThan(version=None):
+
+    def dec_fn(fn):
+        @wraps(fn)
+        def wrap_fn(self, *args, **kwargs):
+            if self.device_type == 'cuda':
+                if not TEST_WITH_ROCM:
+                    reason = "ROCm not available"
+                    raise unittest.SkipTest(reason)
+                rocm_version = str(torch.version.hip)
+                rocm_version = rocm_version.split("-")[0]    # ignore git sha
+                rocm_version_tuple = tuple(int(x) for x in rocm_version.split("."))
+                if rocm_version_tuple is None or version is None or rocm_version_tuple < tuple(version):
+                    reason = "ROCm {0} is available but {1} required".format(rocm_version_tuple, version)
+                    raise unittest.SkipTest(reason)
+
+            return fn(self, *args, **kwargs)
+
+        return wrap_fn
+    return dec_fn
+
+# Skips a test on CUDA when using ROCm.
+def skipCUDAIfNotMiopenSuggestNHWC(fn):
+    return skipCUDAIf(not TEST_WITH_MIOPEN_SUGGEST_NHWC, "test doesn't currently work without MIOpen NHWC activation")(fn)
 
 # Skips a test for specified CUDA versions, given in the form of a list of [major, minor]s.
 def skipCUDAVersionIn(versions : List[Tuple[int, int]] = None):
@@ -1146,7 +1254,7 @@ def skipCUDAIfCudnnVersionLessThan(version=0):
 
     def dec_fn(fn):
         @wraps(fn)
-        def wrap_fn(self, device, *args, **kwargs):
+        def wrap_fn(self, *args, **kwargs):
             if self.device_type == 'cuda':
                 if self.no_cudnn:
                     reason = "cuDNN not available"
@@ -1155,14 +1263,26 @@ def skipCUDAIfCudnnVersionLessThan(version=0):
                     reason = "cuDNN version {0} is available but {1} required".format(self.cudnn_version, version)
                     raise unittest.SkipTest(reason)
 
-            return fn(self, device, *args, **kwargs)
+            return fn(self, *args, **kwargs)
 
         return wrap_fn
     return dec_fn
 
+# Skips a test on CUDA if cuSparse generic API is not available
+def skipCUDAIfNoCusparseGeneric(fn):
+    return skipCUDAIf(not TEST_CUSPARSE_GENERIC, "cuSparse Generic API not available")(fn)
 
 def skipCUDAIfNoCudnn(fn):
     return skipCUDAIfCudnnVersionLessThan(0)(fn)
 
+def skipCUDAIfMiopen(fn):
+    return skipCUDAIf(torch.version.hip is not None, "Marked as skipped for MIOpen")(fn)
+
+def skipCUDAIfNoMiopen(fn):
+    return skipCUDAIf(torch.version.hip is None, "MIOpen is not available")(skipCUDAIfNoCudnn(fn))
+
 def skipMeta(fn):
     return skipMetaIf(True, "test doesn't work with meta tensors")(fn)
+
+def skipXLA(fn):
+    return skipXLAIf(True, "Marked as skipped for XLA")(fn)

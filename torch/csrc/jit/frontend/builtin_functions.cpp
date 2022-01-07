@@ -1,5 +1,6 @@
 #include <torch/csrc/jit/frontend/builtin_functions.h>
 
+#include <caffe2/serialize/versions.h>
 #include <torch/csrc/api/include/torch/jit.h>
 #include <torch/csrc/jit/frontend/code_template.h>
 #include <torch/csrc/jit/frontend/resolver.h>
@@ -7,7 +8,6 @@
 namespace torch {
 namespace jit {
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 auto scalar_operators_source = CodeTemplate(
     R"SCRIPT(
 def mul(a : ${Scalar}, b : Tensor) -> Tensor:
@@ -32,27 +32,30 @@ def div(a : ${Scalar}, b : Tensor) -> Tensor:
   return torch.reciprocal(b) * a
 )SCRIPT");
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 auto _ntuple_ops = CodeTemplate(
     R"SCRIPT(
 def _${name}(x: BroadcastingList${Length}[${Scalar}]) -> List[${Scalar}]:
   return x
 )SCRIPT");
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 auto floordiv = CodeTemplate(
     R"SCRIPT(
 def floordiv(self : Tensor, other : ${Rhs_Type}) -> Tensor:
   return torch.floor_divide(self, other)
 )SCRIPT");
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 auto tensor_properties =
     R"SCRIPT(
 def ndim(a : Tensor) -> int:
   return a.dim()
 def T(a : Tensor) -> Tensor:
   return a.numpy_T()
+def H(a : Tensor) -> Tensor:
+  return a.matrix_H()
+def mT(a : Tensor) -> Tensor:
+  return a.mT
+def mH(a : Tensor) -> Tensor:
+  return a.mH
 def shape(a : Tensor) -> List[int]:
   return a.size()
 )SCRIPT";
@@ -61,7 +64,6 @@ def shape(a : Tensor) -> List[int]:
 // aten::_assert_int_or_pair op which was removed once we were able to compile
 // torch.nn.functional.assert_int_or_pair
 // list_with_default also needs to be here for BC
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 auto aten_ops =
     R"SCRIPT(
 def _assert_int_or_pair(vals: List[int], name: str, message: str):
@@ -84,11 +86,11 @@ def __contains__(self: str, key: str):
     return self.find(key, 0, len(self)) != -1
 )SCRIPT";
 
+#if !ENABLE_UPGRADERS
 // Implementations of historic symbol behaviors are defined here
 // See note [Versioned Symbols]
 
 // This builtin is for testing
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 auto _test_serialization_subcmul = R"SCRIPT(
 def _test_serialization_subcmul_0_2(self: Tensor, other:Tensor, alpha: number=2) -> Tensor:
   return other - (self * alpha)
@@ -101,7 +103,6 @@ def _test_serialization_subcmul_0_2(self: Tensor, other:Tensor, alpha: number=2)
 // NOTE: testing for the tensors being float tensors is sufficient here,
 // because the Torchscript versions this fix applies to (0 through 3)
 // did not support complex tensors.
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 auto div_tensor = R"SCRIPT(
 def div_0_3(self: Tensor, other: Tensor) -> Tensor:
   if (self.is_floating_point() or other.is_floating_point()):
@@ -110,7 +111,6 @@ def div_0_3(self: Tensor, other: Tensor) -> Tensor:
 )SCRIPT";
 
 // Tensor x Scalar
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 auto div_tensor_scalar = R"SCRIPT(
 def div_0_3(self: Tensor, other: number) -> Tensor:
   if (self.is_floating_point() or isinstance(other, float)):
@@ -119,7 +119,6 @@ def div_0_3(self: Tensor, other: number) -> Tensor:
 )SCRIPT";
 
 // Scalar x Scalar
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 auto div_scalar_scalar = R"SCRIPT(
 def div_0_3(self: number, other: number) -> number:
   return self / other
@@ -127,7 +126,6 @@ def div_0_3(self: number, other: number) -> number:
 
 // Tensor x Tensor with out kwarg
 // NOTE: the JIT doesn't support Tensor x Scalar with the out kwarg
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 auto div_tensor_out = R"SCRIPT(
 def div_0_3(self: Tensor, other: Tensor, *, out: Tensor) -> Tensor:
   if (self.is_floating_point() or other.is_floating_point() or out.is_floating_point()):
@@ -136,7 +134,6 @@ def div_0_3(self: Tensor, other: Tensor, *, out: Tensor) -> Tensor:
 )SCRIPT";
 
 // Tensor x Tensor inplace
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 auto div__tensor = R"SCRIPT(
 def div__0_3(self: Tensor, other: Tensor) -> Tensor:
   if (self.is_floating_point() or other.is_floating_point()):
@@ -145,7 +142,6 @@ def div__0_3(self: Tensor, other: Tensor) -> Tensor:
 )SCRIPT";
 
 // Tensor x Scalar inplace
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 auto div__scalar = R"SCRIPT(
 def div__0_3(self: Tensor, other: number) -> Tensor:
   if (self.is_floating_point() or isinstance(other, float)):
@@ -158,24 +154,22 @@ def div__0_3(self: Tensor, other: number) -> Tensor:
 // NOTE: Torchscript does not currently support complex values
 // NOTE: Torchscript does not currently support named tensors, although
 //   torch.full does have a named tensor variant
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 auto full = R"SCRIPT(
 def full_0_4(size:List[int], fill_value:number, *, dtype:Optional[int]=None,
              layout:Optional[int]=None, device:Optional[Device]=None,
              pin_memory:Optional[bool]=None) -> Tensor:
   if dtype is None:
     fill_value = float(fill_value)
-
   return torch.full(size, fill_value, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
 )SCRIPT";
 
 // NOTE: the out variant of full works the same, but must be overridden
 //   since the other variant of full is overridden
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 auto full_out = R"SCRIPT(
 def full_0_4(size:List[int], fill_value:number, *, out:Tensor) -> Tensor:
   return torch.full(size, fill_value, out=out)
 )SCRIPT";
+#endif
 
 struct BuiltinFunctionRegistry {
   const std::vector<Function*>& getAllBuiltinFunctionsFor(Symbol name) {
@@ -245,6 +239,7 @@ struct BuiltinFunctionRegistry {
     loadSource(aten_ops, "aten");
     loadSource(aten_ops_additional, "aten");
 
+#if !ENABLE_UPGRADERS
     // Loads functions implementing historic behavior, see note [Versioned
     // Symbols]
     // Note: these functions go into the "upgraders" namespace
@@ -257,6 +252,7 @@ struct BuiltinFunctionRegistry {
     loadSource(div__scalar, "upgraders");
     loadSource(full, "upgraders");
     loadSource(full_out, "upgraders");
+#endif
 
     // These are under `prim` instead of `aten` since they exist to bind certain
     // tensor property getters to correpsonding methods

@@ -25,9 +25,9 @@ MPI supports CUDA only if the implementation used to build PyTorch supports it.
 +----------------+-----+-----+-----+-----+-----+-----+
 | Device         | CPU | GPU | CPU | GPU | CPU | GPU |
 +================+=====+=====+=====+=====+=====+=====+
-| send           | ✓   | ✘   | ✓   | ?   | ✘   | ✘   |
+| send           | ✓   | ✘   | ✓   | ?   | ✘   | ✓   |
 +----------------+-----+-----+-----+-----+-----+-----+
-| recv           | ✓   | ✘   | ✓   | ?   | ✘   | ✘   |
+| recv           | ✓   | ✘   | ✓   | ?   | ✘   | ✓   |
 +----------------+-----+-----+-----+-----+-----+-----+
 | broadcast      | ✓   | ✓   | ✓   | ?   | ✘   | ✓   |
 +----------------+-----+-----+-----+-----+-----+-----+
@@ -180,6 +180,8 @@ joined.
 
 .. autofunction:: is_nccl_available
 
+.. autofunction:: is_torchelastic_launched
+
 --------------------------------------------------------------------------------
 
 Currently three initialization methods are supported:
@@ -298,6 +300,7 @@ Key-Value Stores: :class:`~torch.distributed.TCPStore`,
 .. autofunction:: torch.distributed.Store.set
 .. autofunction:: torch.distributed.Store.get
 .. autofunction:: torch.distributed.Store.add
+.. autofunction:: torch.distributed.Store.compare_set
 .. autofunction:: torch.distributed.Store.wait
 .. autofunction:: torch.distributed.Store.num_keys
 .. autofunction:: torch.distributed.Store.delete_key
@@ -446,25 +449,6 @@ Note that you can use ``torch.profiler`` (recommended, only available after 1.8.
 
 Please refer to the `profiler documentation <https://pytorch.org/docs/master/profiler.html>`__ for a full overview of profiler features.
 
-Autograd-enabled communication primitives
------------------------------------------
-
-If you want to use collective communication functions supporting autograd
-you can find an implementation of those in the `torch.distributed.nn.*` module.
-
-Functions here are synchronous and will be inserted in the autograd graph, so
-you need to ensure that all the processes that participated in the collective operation
-will do the backward pass for the backward communication to effectively happen and
-don't cause a deadlock.
-
-Please notice that currently the only backend where all the functions are guaranteed to work is ``gloo``.
-.. autofunction:: torch.distributed.nn.broadcast
-.. autofunction:: torch.distributed.nn.gather
-.. autofunction:: torch.distributed.nn.scatter
-.. autofunction:: torch.distributed.nn.reduce
-.. autofunction:: torch.distributed.nn.all_gather
-.. autofunction:: torch.distributed.nn.all_to_all
-.. autofunction:: torch.distributed.nn.all_reduce
 
 Multi-GPU collective functions
 ------------------------------

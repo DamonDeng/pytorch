@@ -1,4 +1,4 @@
-
+import enum
 import torch
 import warnings
 import inspect
@@ -212,8 +212,23 @@ def _is_constant(value):
 def _is_tensor(x):
     return x.type().isSubtypeOf(torch._C.TensorType.get())
 
+def _is_list(x):
+    return isinstance(x.type(), torch._C.ListType)
+
 def _is_tensor_list(x):
-    return isinstance(x.type(), torch._C.ListType) and isinstance(x.type().getElementType(), torch._C.TensorType)
+    return _is_list(x) and isinstance(x.type().getElementType(), torch._C.TensorType)
+
+def _is_scalar_list(x):
+    """
+    Check if x is a scalar list, for example: List[float], List[int].
+
+    Besides checking the type is ListType, we also check if the data type is
+    a valid ONNX data type.
+    """
+    element_type = str(x.type().getElementType())
+    return _is_list(x) and \
+        element_type in scalar_name_to_pytorch.keys() and \
+        (scalar_name_to_pytorch[element_type] in cast_pytorch_to_onnx.keys())
 
 def _get_tensor_rank(x):
     if not _is_tensor(x) or x.type() is None:
@@ -283,7 +298,7 @@ def _select_helper(g, self, dim, index, apply_reshape=True):
     elif index_dim is not None and apply_reshape:
         if index_dim == 0:
             # Index is a scalar. Reshape it to a size 1 tensor.
-            index = g.op("Reshape", index, g.op("Constant", value_t=torch.LongTensor([1])))
+            index = _reshape_helper(g, index, g.op("Constant", value_t=torch.LongTensor([1])))
 
     index_scalar_type = index.type().scalarType()
     if index_scalar_type is None or index_scalar_type not in ["Long", "Int"]:
@@ -299,29 +314,15 @@ def _slice_helper(g, input, axes, starts, ends, steps=None, dynamic_slice=False)
         from torch.onnx.symbolic_opset10 import _slice as _slice10
         return _slice10(g, input, axes, starts, ends, steps, dynamic_slice)
 
-def _hardtanh_helper(g, input, min_val, max_val):
-    if _export_onnx_opset_version <= 10:
-        from torch.onnx.symbolic_opset9 import hardtanh
-        return hardtanh(g, input, min_val, max_val)
-    else:
-        from torch.onnx.symbolic_opset11 import hardtanh  # type: ignore[no-redef]
-        return hardtanh(g, input, min_val, max_val)
-
 def _is_fp(value):
     if value:
         if isinstance(value, torch.Tensor):
-            type = value.dtype
-            return (type == "torch.float32") or (type == "torch.float64") or (type == "torch.float16")
+            return value.dtype in (torch.float16, torch.float32, torch.float64, torch.bfloat16)
         else:
             type = value.type().scalarType()
             if type is None:
                 warnings.warn("Type cannot be inferred, which might cause exported graph to produce incorrect results.")
-            return (type == "Float") or (type == "Double") or (type == "Half")
-    return False
-
-def _dtype_is_fp(type_value):
-    if type_value:
-        return (type_value == torch.float16) or (type_value == torch.float32) or (type_value == torch.float64)
+            return type in ("Float", "Double", "Half", "BFloat16")
     return False
 
 def _generate_wrapped_number(g, scalar):
@@ -360,13 +361,22 @@ def _topk_helper(g, input, k, dim, largest=True, sorted=False, out=None):
     if not _is_value(k):
         k = g.op("Constant", value_t=torch.tensor([k], dtype=torch.int64))
     else:
-        k = g.op("Reshape", k, g.op("Constant", value_t=torch.tensor([1])))
+        k = _reshape_helper(g, k, g.op("Constant", value_t=torch.tensor([1])))
     if _export_onnx_opset_version <= 10:
         if not largest:
             _unimplemented("TopK", "Ascending is not supported")
         return g.op("TopK", input, k, axis_i=dim, outputs=2)
     else:
         return g.op("TopK", input, k, axis_i=dim, largest_i=largest, sorted_i=sorted, outputs=2)
+
+
+def _lt_helper(g, input, other):
+    if _export_onnx_opset_version <= 8:
+        from torch.onnx.symbolic_opset8 import lt as _lt8
+        return _lt8(g, input, other)
+    else:
+        from torch.onnx.symbolic_opset9 import lt as _lt9
+        return _lt9(g, input, other)
 
 
 def _interpolate_warning(interpolate_mode):
@@ -661,6 +671,12 @@ def _arange_cast_helper(g, end, start=None, step=None, dtype=None):
     step = g.op("Cast", step, to_i=scalar_type_to_onnx[type]) if step else None
     return type, end, start, step
 
+def _arange_helper(g, *args):
+    if _export_onnx_opset_version <= 10:
+        from torch.onnx.symbolic_opset9 import arange
+    else:
+        from torch.onnx.symbolic_opset11 import arange  # type: ignore[no-redef]
+    return arange(g, *args)
 
 def _size_helper(g, self, dim):
     full_shape = g.op("Shape", self)
@@ -691,6 +707,48 @@ def _index_fill_reshape_helper(g, self, dim, index):
     expanded_index = expand(g, unsqueezed_index, expanded_index_shape, None)
     return expanded_index_shape, expanded_index
 
+# When using reshape helper (opset_version >= 14), if reshape has -1,
+# allowzero cannot be set to 1
+def _reshape_helper(g, input, shape, allowzero=0):
+    shape = _maybe_get_const(shape, "is")
+    if not _is_value(shape):
+        shape = g.op("Constant", value_t=torch.LongTensor(shape))
+    if _export_onnx_opset_version <= 13:
+        return g.op("Reshape", input, shape)
+    else:
+        warnings.warn("allowzero=0 by default. In order to honor zero value in shape use allowzero=1")
+        return g.op("Reshape", input, shape, allowzero_i=allowzero)
+
+def _batchnorm_helper(g, input, weight, bias, running_mean, running_var):
+    from torch.onnx.symbolic_opset9 import _var_mean
+    batch_size = _get_tensor_dim_size(input, 0)
+    channel_size = _get_tensor_dim_size(input, 1)
+
+    if weight is None or _is_none(weight):
+        if channel_size is None:
+            raise RuntimeError("Unsupported: ONNX export of batch_norm for unknown "
+                               "channel size.")
+        weight_value = torch.tensor([1.] * channel_size).type(
+            "torch." + input.type().scalarType() + "Tensor")
+        weight = g.op("Constant", value_t=weight_value)
+    if bias is None or _is_none(bias):
+        if channel_size is None:
+            raise RuntimeError("Unsupported: ONNX export of batch_norm for unknown "
+                               "channel size.")
+        bias_value = torch.tensor([0.] * channel_size).type(
+            "torch." + input.type().scalarType() + "Tensor")
+        bias = g.op("Constant", value_t=bias_value)
+    # If track_running_stats is set to False batch statistics are instead used during evaluation time
+    if running_mean is None or _is_none(running_mean) or running_var is None or _is_none(running_var):
+        assert batch_size is not None and channel_size is not None
+        reshape_in = _reshape_helper(g, input,
+                                     g.op("Constant", value_t=torch.tensor([batch_size, channel_size, -1],
+                                          dtype=torch.int64)))
+        trans_in = g.op("Transpose", reshape_in, perm_i=[0, 2, 1])
+        running_var, running_mean = _var_mean(g, trans_in,
+                                              g.op("Constant", value_t=torch.tensor([0, 1], dtype=torch.int64)),
+                                              False, False)
+    return weight, bias, running_mean, running_var
 
 def _avgpool_helper(tuple_fn, padding, kernel_size, stride, divisor_override, name):
     if divisor_override and divisor_override.node().kind() != "prim::Constant":
@@ -700,19 +758,23 @@ def _avgpool_helper(tuple_fn, padding, kernel_size, stride, divisor_override, na
     padding = tuple(tuple_fn(padding))
     return padding
 
-def assert_training_mode(op_mode, op_name):
+
+def check_training_mode(op_train_mode, op_name):
     global _training_mode
-    op_mode = True if op_mode == 1 else False
-    if op_mode != _training_mode:
-        op_mode = "training " if op_mode else "inference"
+    op_train_mode = True if op_train_mode == 1 else False
+    if _training_mode is not None and op_train_mode != _training_mode:
+        op_mode = "training " if op_train_mode else "inference"
         training_mode = "training " if _training_mode else "inference"
         # setting the model mode could result in op_mode != _training_mode
         # if the model is a FuncModule. In this case we warn the user of
-        # the state and export depending on training_mode
+        # the state and export depending on op_mode
+        # This is to support use-cases of fixing certain layer weights
+        # in training.
         warnings.warn("ONNX export mode is set to " + training_mode +
                       " mode, but operator " + op_name + " is set to " +
-                      op_mode + " mode. The model will be exported in " +
-                      training_mode + ", as specified by the export mode.")
+                      op_mode + " mode. The operators will be exported in " +
+                      op_mode + ", as specified by the functional operator.")
+
 
 def _flatten_helper(g, input, start_dim, end_dim, dim):
     input_size = g.op("Shape", input)
@@ -739,8 +801,8 @@ def _optional_input_placeholder_tensor(g):
     return n
 
 def _handle_reduce_dim_none(g, self, op_name):
-    dim_size = _get_tensor_dim_size(self, 0)
-    if dim_size is None or dim_size == 0:
+    rank = _get_tensor_rank(self)
+    if rank is not None and any([_get_tensor_dim_size(self, i) == 0 for i in range(rank)]):
         # If input tensor is empty, according to ONNX ReduceSum definition,
         # set keepdims=1 so that the resulted tensor has the same rank as the input.
         return g.op(op_name, self, keepdims_i=1)
@@ -774,8 +836,8 @@ def _handle_reduce_dim_none(g, self, op_name):
 
 
 _default_onnx_opset_version = 9
-_onnx_main_opset = 13
-_onnx_stable_opsets = [7, 8, 9, 10, 11, 12]
+_onnx_main_opset = 15
+_onnx_stable_opsets = [7, 8, 9, 10, 11, 12, 13, 14]
 _export_onnx_opset_version = _default_onnx_opset_version
 
 
@@ -825,6 +887,7 @@ cast_pytorch_to_onnx = {
     "Bool": torch.onnx.TensorProtoDataType.BOOL,
     "ComplexFloat": torch.onnx.TensorProtoDataType.COMPLEX64,
     "ComplexDouble": torch.onnx.TensorProtoDataType.COMPLEX128,
+    "BFloat16": torch.onnx.TensorProtoDataType.BFLOAT16,
     "Undefined": torch.onnx.TensorProtoDataType.UNDEFINED,
 }
 
@@ -839,13 +902,38 @@ scalar_name_to_pytorch = {
     "int16_t": "Short",
     "bool": "Bool",
     "complex64": "ComplexFloat",
-    "complex128": "ComplexDouble"
+    "complex128": "ComplexDouble",
+    "qint8": "QInt8",
+    "quint8": "QUInt8",
+    "qint32": "QInt32",
+    "bfloat16": "BFloat16",
 }
+
+
+
+class ScalarType(enum.IntEnum):
+    """A human-readable name for a key into scalar_type_to_pytorch_type."""
+    UINT8 = 0
+    INT8 = enum.auto()
+    SHORT = enum.auto()
+    INT = enum.auto()
+    INT64 = enum.auto()
+    HALF = enum.auto()
+    FLOAT = enum.auto()
+    DOUBLE = enum.auto()
+    COMPLEX32 = enum.auto()
+    COMPLEX64 = enum.auto()
+    COMPLEX128 = enum.auto()
+    BOOL = enum.auto()
+    QINT8 = enum.auto()
+    QUINT8 = enum.auto()
+    QINT32 = enum.auto()
+    BFLOAT16 = enum.auto()
 
 
 # This indicates each scalar type's corresponding
 # torch type. Related source:
-# https://github.com/pytorch/pytorch/blob/da7468853ae322252270bbb58032668bd21b7457/c10/core/ScalarType.h
+# https://github.com/pytorch/pytorch/blob/344defc9733a45fee8d0c4d3f5530f631e823196/c10/core/ScalarType.h
 scalar_type_to_pytorch_type = [
     torch.uint8,        # 0
     torch.int8,         # 1
@@ -859,6 +947,10 @@ scalar_type_to_pytorch_type = [
     torch.complex64,    # 9
     torch.complex128,   # 10
     torch.bool,         # 11
+    torch.qint8,        # 12
+    torch.quint8,       # 13
+    torch.qint32,       # 14
+    torch.bfloat16,     # 15
 ]
 
 def _cast_func_template(to_i, g, input, non_blocking):
@@ -866,18 +958,22 @@ def _cast_func_template(to_i, g, input, non_blocking):
 
 
 scalar_type_to_onnx = [
-    cast_pytorch_to_onnx["Byte"],
-    cast_pytorch_to_onnx["Char"],
-    cast_pytorch_to_onnx["Short"],
-    cast_pytorch_to_onnx["Int"],
-    cast_pytorch_to_onnx["Long"],
-    cast_pytorch_to_onnx["Half"],
-    cast_pytorch_to_onnx["Float"],
-    cast_pytorch_to_onnx["Double"],
-    cast_pytorch_to_onnx["Undefined"],
-    cast_pytorch_to_onnx["ComplexFloat"],
-    cast_pytorch_to_onnx["ComplexDouble"],
-    cast_pytorch_to_onnx["Bool"],
+    cast_pytorch_to_onnx["Byte"],            # 0
+    cast_pytorch_to_onnx["Char"],            # 1
+    cast_pytorch_to_onnx["Short"],           # 2
+    cast_pytorch_to_onnx["Int"],             # 3
+    cast_pytorch_to_onnx["Long"],            # 4
+    cast_pytorch_to_onnx["Half"],            # 5
+    cast_pytorch_to_onnx["Float"],           # 6
+    cast_pytorch_to_onnx["Double"],          # 7
+    cast_pytorch_to_onnx["Undefined"],       # 8
+    cast_pytorch_to_onnx["ComplexFloat"],    # 9
+    cast_pytorch_to_onnx["ComplexDouble"],   # 10
+    cast_pytorch_to_onnx["Bool"],            # 11
+    cast_pytorch_to_onnx["Char"],            # 12
+    cast_pytorch_to_onnx["Byte"],            # 13
+    cast_pytorch_to_onnx["Int"],             # 14
+    cast_pytorch_to_onnx["BFloat16"],        # 15
 ]
 
 # Global set to store the list of quantized operators in the network.

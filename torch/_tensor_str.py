@@ -42,6 +42,16 @@ def set_printoptions(
             None (default) is specified, the value is defined by
             `torch._tensor_str._Formatter`. This value is automatically chosen
             by the framework.
+
+    Example::
+
+        >>> torch.set_printoptions(precision=2)
+        >>> torch.tensor([1.12345])
+        tensor([1.12])
+        >>> torch.set_printoptions(threshold=5)
+        >>> torch.arange(10)
+        tensor([0, 1, 2, ..., 7, 8, 9])
+
     """
     if profile is not None:
         if profile == "default":
@@ -233,10 +243,19 @@ def _tensor_str(self, indent):
         self = self.rename(None)
 
     summarize = self.numel() > PRINT_OPTS.threshold
+
+    if self._is_zerotensor():
+        self = self.clone()
+
+    # handle the negative bit
+    if self.is_neg():
+        self = self.resolve_neg()
+
     if self.dtype is torch.float16 or self.dtype is torch.bfloat16:
         self = self.float()
 
     if self.dtype.is_complex:
+        # handle the conjugate bit
         self = self.resolve_conj()
         real_formatter = _Formatter(get_summarized_data(self.real) if summarize else self.real)
         imag_formatter = _Formatter(get_summarized_data(self.imag) if summarize else self.imag)

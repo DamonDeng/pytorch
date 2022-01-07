@@ -1,6 +1,7 @@
 #include <ATen/ATen.h>
 #include <ATen/native/Resize.h>
 #include <ATen/native/ResizeCommon.h>
+#include <ATen/TensorSubclassLikeUtils.h>
 
 #include <c10/core/TensorOptions.h>
 
@@ -8,7 +9,7 @@ namespace at { namespace native {
 
 // Returns true if resize is necessary
 bool resize_output_check(const Tensor& output, IntArrayRef shape) {
-  // Tests for resizing of tensors with one more elements
+  // Tests for resizing of tensors with one or more elements
   if (output.sizes().equals(shape)) {
     return false;
   }
@@ -30,7 +31,10 @@ bool resize_output(const Tensor& output, IntArrayRef shape) {
     // avoid a redispatch for cpu and cuda.
     // TODO: when resize_cuda_ is re-written to be unified with resize_,
     // we can provide the same benefit for cuda.
-    if (output.is_cpu()) {
+    //
+    // TODO(#61485): functorch wrapped tensors should not go through the
+    // fast path. This is a hack, longer term solutions are in the issue
+    if (output.is_cpu() && !isTensorSubclassLike(output)) {
       at::native::resize_(output, shape);
     } else {
       output.resize_(shape);

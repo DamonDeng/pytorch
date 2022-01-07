@@ -1,12 +1,13 @@
 #include <torch/csrc/jit/frontend/versioned_symbols.h>
 
+#include <caffe2/serialize/versions.h>
 #include <torch/csrc/api/include/torch/jit.h>
 
 #include <unordered_map>
 
 namespace torch {
 namespace jit {
-
+#if !ENABLE_UPGRADERS
 // Note [Versioned Symbols]
 // When the schema or behavior of a symbol changes, serialized Torchscript
 // programs using that symbol are likely to break. To prevent those breaks,
@@ -64,7 +65,6 @@ struct SymbolRange {
   const Symbol sym_;
 };
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 static std::unordered_map<Symbol, SymbolRange> symbol_range_map({
     {Symbol::fromQualString("aten::_test_serialization_subcmul"),
      {0,
@@ -78,7 +78,6 @@ static std::unordered_map<Symbol, SymbolRange> symbol_range_map({
      {0, 4, Symbol::fromQualString("upgraders::full_0_4")}},
 });
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 static std::unordered_map<NodeKind, uint64_t> kind_min_version_map({
     {aten::div, 4},
     {aten::div_, 4},
@@ -107,6 +106,7 @@ uint64_t get_min_version_for_kind(const NodeKind& kind) {
 
   return it->second;
 }
+#endif
 
 } // namespace jit
 } // namespace torch

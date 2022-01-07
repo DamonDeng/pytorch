@@ -3,12 +3,12 @@
 
 #include <ATen/ATen.h>
 #include <ATen/core/Vitals.h>
+#include <c10/util/irange.h>
 #include <cstdlib>
 
 using namespace at::vitals;
 using ::testing::HasSubstr;
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(Vitals, Basic) {
   std::stringstream buffer;
 
@@ -38,7 +38,6 @@ TEST(Vitals, Basic) {
   ASSERT_THAT(s, HasSubstr("Testing.Attribute4\t\t  1"));
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(Vitals, MultiString) {
   std::stringstream buffer;
 
@@ -63,9 +62,8 @@ TEST(Vitals, MultiString) {
   ASSERT_THAT(s, HasSubstr("Testing.Attribute1\t\t 1 of 2"));
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(Vitals, OnAndOff) {
-  for (auto i = 0; i < 2; ++i) {
+  for (const auto i : c10::irange(2)) {
     std::stringstream buffer;
 
     std::streambuf* sbuf = std::cout.rdbuf();
@@ -95,7 +93,6 @@ TEST(Vitals, OnAndOff) {
   }
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(Vitals, APIVitals) {
   std::stringstream buffer;
   // NOLINTNEXTLINE(cppcoreguidelines-init-variables)

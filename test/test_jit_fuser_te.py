@@ -1,4 +1,7 @@
+# Owner(s): ["NNC"]
+
 import operator
+import os
 import unittest
 import contextlib
 import math
@@ -6,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch.testing import FileCheck
 from typing import List
+import warnings
 
 # these needs to be set before `common_utils`
 # infers `GRAPH_EXECUTOR`.
@@ -29,8 +33,6 @@ from itertools import product, permutations
 
 from test_jit import backward_graph, get_lstm_inputs, get_milstm_inputs, \
     LSTMCellC, LSTMCellF, LSTMCellS, MiLSTMCell
-
-from torch.testing._internal.te_utils import CudaCodeGenExecuted
 
 from jit.test_fuser_common import TestFuserCommon  # noqa: F401
 
@@ -87,10 +89,6 @@ class TestTEFuser(JitTestCase):
         self.old_te_must_use_llvm_cpu = torch._C._jit_get_te_must_use_llvm_cpu()
         torch._C._jit_set_te_must_use_llvm_cpu(False)
 
-        # TODO: CPU fuser currently is disabled when multithreading.
-        self.old_fuse_parallel = torch._C._jit_texpr_parallel_cpu_enabled()
-        torch._C._jit_set_texpr_parallel_cpu_enabled(True)
-
         self.devices = ['cpu'] if not torch.cuda.is_available() else ['cpu', 'cuda']
         self.int_dtypes = [
             torch.int8,
@@ -100,10 +98,10 @@ class TestTEFuser(JitTestCase):
             torch.bool,
         ]
         self.fp_dtypes = [
-            # TODO: Add back when https://github.com/pytorch/pytorch/issues/55905 is closed
-            # torch.float16,
+            torch.float16,
             torch.float32,
             torch.float64,
+            torch.bfloat16,
         ]
         self.dtypes = self.int_dtypes + self.fp_dtypes
 
@@ -118,7 +116,6 @@ class TestTEFuser(JitTestCase):
 
         torch._C._jit_set_texpr_fuser_enabled(self.texpr_fuser_state)
         torch._C._jit_set_te_must_use_llvm_cpu(self.old_te_must_use_llvm_cpu)
-        torch._C._jit_set_texpr_parallel_cpu_enabled(self.old_fuse_parallel)
 
     def assertLastGraphAllFused(self):
         self.assertAllFused(torch.jit.last_executed_optimized_graph())
@@ -848,7 +845,7 @@ class TestTEFuser(JitTestCase):
                 inputs = get_lstm_inputs(device)
                 ge = self.checkTrace(LSTMCellC, inputs)
                 graph = ge.graph_for(*inputs)
-                self.assertLastGraphAllFused()
+                self.assertAllFused(ge.graph_for(*inputs))
                 # XXX: TE fuser can handle concats inside a fusion group.
                 # FileCheck().check("FusedConcat").check_next("return").run(str(graph))
 
@@ -913,9 +910,7 @@ class TestTEFuser(JitTestCase):
         x = torch.zeros([3, 4, 5], dtype=torch.float, device='cuda')
         m = M()
         out1 = m.create(x)
-        cx = CudaCodeGenExecuted()
         out2 = m.create(x)
-        assert cx.elapsed_value() == 1
         self.assertNotEqual(out1, out2)
         self.assertTrue(torch.all(out1 >= 0))
         self.assertTrue(torch.all(out1 < 1))
@@ -994,9 +989,7 @@ class TestTEFuser(JitTestCase):
         y = torch.randn(4, 4, dtype=torch.float, device='cuda')
         script_f = torch.jit.script(fn_test_diamond)
         warmup_forward(script_f, x, y)
-        cx = CudaCodeGenExecuted()
         out = script_f(x, y)
-        assert cx.elapsed_value() == 1
         self.assertEqual(out, x + y)
 
     def test_scalar(self):
@@ -1141,8 +1134,7 @@ class TestTEFuser(JitTestCase):
         dtypes = [
             torch.bool,
             torch.int,
-            # TODO: Add back when https://github.com/pytorch/pytorch/issues/55905 is closed
-            # torch.float16,
+            torch.float16,
             torch.float32,
             torch.float64,
         ]
@@ -1157,6 +1149,9 @@ class TestTEFuser(JitTestCase):
 
         bad_dtypes = []
         for dtype, output_dtype, device, size in product(dtypes, dtypes, self.devices, sizes):
+            # TODO: Add back when https://github.com/pytorch/pytorch/issues/55905 is closed
+            if dtype in [torch.float16, torch.bfloat16] and device == "cpu":
+                continue
             if dtype == output_dtype:
                 continue
 
@@ -1192,7 +1187,7 @@ class TestTEFuser(JitTestCase):
             ref = fn(input_v, mask)
             try:
                 t = torch.jit.trace(fn, (input_v, mask))
-                torch.testing.assert_allclose(ref, t(input_v, mask))
+                torch.testing.assert_close(ref, t(input_v, mask))
                 print(torch.jit.last_executed_optimized_graph())
                 self.assertLastGraphAllFused()
             except Exception as e:
@@ -1212,18 +1207,16 @@ class TestTEFuser(JitTestCase):
             torch.int16,
             torch.int32,
             torch.int64,
-            # TODO: Add back when https://github.com/pytorch/pytorch/issues/55905 is closed
-            # torch.float16,
+            torch.float16,
             torch.float32,
             torch.float64,
             torch.bool,
         ]
 
         for inp, device, dtype in product(inputs, self.devices, dtypes):
-            # TODO
-            if dtype == torch.float16 and not LLVM_ENABLED:
+            # TODO: Add back when https://github.com/pytorch/pytorch/issues/55905 is closed
+            if dtype in [torch.float16, torch.bfloat16] and device == "cpu":
                 continue
-
             inp = inp.to(device=device, dtype=dtype)
             try:
                 f = torch.jit.trace(lambda x: x.isnan(), (inp,))
@@ -1266,6 +1259,7 @@ class TestTEFuser(JitTestCase):
             F.hardtanh,
             F.hardsigmoid,
             F.hardswish,
+            F.softplus,
             torch.sqrt,
             torch.rsqrt,
             F.gelu,
@@ -1275,13 +1269,20 @@ class TestTEFuser(JitTestCase):
             torch.round,
             torch.trunc,
             torch.frac,
-            F.hardshrink,
+            # TODO: broken on ROCm?
+            # F.hardshrink,
             F.leaky_relu,
             lambda x: torch.threshold(x, 0, -10),
             lambda x: torch.clamp(x, -10, 10),
         ]
+        gpu_only = {torch.erf, torch.erfc}
         sizes = [(1,), (2,), (4, 4)]
         for dtype, op, device, size in product(self.dtypes, unary_ops, self.devices, sizes):
+            # TODO: Add back when https://github.com/pytorch/pytorch/issues/55905 is closed
+            if dtype in [torch.float16, torch.bfloat16] and device == "cpu":
+                continue
+            if op in gpu_only and device == "cpu":
+                continue
             try:
                 x = self.data_for(dtype, device, size=size)
                 fn = apply(op)
@@ -1293,7 +1294,7 @@ class TestTEFuser(JitTestCase):
                 continue
             try:
                 t = torch.jit.trace(fn, (x,))
-                torch.testing.assert_allclose(ref, t(x))
+                torch.testing.assert_close(ref, t(x))
                 self.assertAllFused(t.graph_for(x))
             except Exception as e:
                 raise RuntimeError(
@@ -1331,6 +1332,8 @@ class TestTEFuser(JitTestCase):
         ]
         devices = self.devices
         for dtype, op, device in product(self.dtypes, binary_ops, devices):
+            if dtype in [torch.float16, torch.bfloat16] and device == "cpu":
+                continue
             try:
                 x = self.data_for(dtype, device)
                 y = self.data_for(dtype, device)
@@ -1381,6 +1384,8 @@ class TestTEFuser(JitTestCase):
                                      "[[10, 3, 4], [4, 5]]",
                                      ]
         for dtype, size, device in product(self.dtypes, sizes, devices):
+            if dtype in [torch.float16, torch.bfloat16] and device == "cpu":
+                continue
             try:
                 size_x, size_y = size
                 x = self.data_for(dtype, device, size=size_x)
@@ -1425,6 +1430,8 @@ class TestTEFuser(JitTestCase):
         # only using  scalar values relevant to particular ops
         scalars = [1.5, 3, 0, -2.0, -1]
         for dtype, op, device, scalar in product(self.dtypes, binary_ops, devices, scalars):
+            if dtype in [torch.float16, torch.bfloat16] and device == "cpu":
+                continue
             try:
                 x = self.data_for(dtype, device)
                 fn = apply_with_scalar(op, scalar)
@@ -1457,6 +1464,8 @@ class TestTEFuser(JitTestCase):
         # only using  scalar values relevant to particular ops
         scalars = [1.5, 3, -2.0, -1]  # skip 0
         for dtype, op, device, scalar in product(self.dtypes, binary_ops, devices, scalars):
+            if dtype in [torch.float16, torch.bfloat16] and device == "cpu":
+                continue
             try:
                 x = self.data_for(dtype, device)
                 fn = apply_with_scalar(op, scalar)
@@ -1492,6 +1501,8 @@ class TestTEFuser(JitTestCase):
         # only using  scalar values relevant to particular ops
         scalars = [1.5, 3, 0, -2.0, -1]
         for dtype, op, device, scalar in product(dtypes, binary_ops, self.devices, scalars):
+            if dtype in [torch.float16, torch.bfloat16] and device == "cpu":
+                continue
             try:
                 x = self.data_for(dtype, device)
                 fn = apply_with_scalar(op, scalar)
@@ -1520,6 +1531,8 @@ class TestTEFuser(JitTestCase):
         ]
         devices = self.devices
         for dtype, op, device in product(self.dtypes, ternary_ops, devices):
+            if dtype in [torch.float16, torch.bfloat16] and device == "cpu":
+                continue
             try:
                 x = self.data_for(dtype, device)
                 y = self.data_for(dtype, device)
@@ -1549,6 +1562,8 @@ class TestTEFuser(JitTestCase):
         ]
         devices = self.devices
         for dtype, op, device in product(self.dtypes, ternary_ops, devices):
+            if dtype in [torch.float16, torch.bfloat16] and device == "cpu":
+                continue
             try:
                 x = self.data_for(dtype, device, size=[5, 3, 128, 128])
                 y = self.data_for(dtype, device, size=[3])
@@ -1580,6 +1595,8 @@ class TestTEFuser(JitTestCase):
             torch.cat,
         ]
         for dtype, op, device in product(self.dtypes, list_ops, devices):
+            if dtype in [torch.float16, torch.bfloat16] and device == "cpu":
+                continue
             try:
                 x = self.data_for(dtype, device, size=[5, 4, 1, 7])
                 y = self.data_for(dtype, device, size=[5, 4, 1, 7])
@@ -1611,6 +1628,8 @@ class TestTEFuser(JitTestCase):
         ]
         devices = self.devices
         for dtype, op, device in product(self.dtypes, ops, devices):
+            if dtype in [torch.float16, torch.bfloat16] and device == "cpu":
+                continue
             try:
                 cond = self.data_for(torch.bool, device)
                 x = self.data_for(dtype, device)
@@ -1638,7 +1657,6 @@ class TestTEFuser(JitTestCase):
 
             unsupported_dtypes = [
                 torch.uint8,
-                torch.bfloat16,
                 torch.complex32,
                 torch.complex64,
                 torch.complex128,
@@ -1689,7 +1707,7 @@ class TestTEFuser(JitTestCase):
             for _ in range(4):
                 for pair in zip(script(*inputs), eager(*inputs)):
                     test, ref = pair
-                    torch.testing.assert_allclose(test, ref)
+                    torch.testing.assert_close(test, ref)
                     self.assertAllFused(script.graph_for(*inputs))
 
     def test_sub_gt_and(self):
@@ -1776,16 +1794,20 @@ class TestTEFuser(JitTestCase):
         with inline_fusion_groups():
             def eager(x, y):
                 return torch.cat((x, y.type_as(x)), dim=1)
-            for dtype1, dtype2 in product(self.dtypes, self.dtypes):
+            dtypes = self.dtypes.copy()
+            # CPU fuser doesn't support float16.
+            dtypes.remove(torch.float16)
+            dtypes.remove(torch.bfloat16)
+            for dtype1, dtype2 in product(dtypes, dtypes):
                 x = torch.randint(2, (1, 13,)).to(dtype1)
                 zero = torch.tensor([[0]]).to(dtype2)
                 one = torch.tensor([[1]]).to(dtype2)
                 script = torch.jit.trace(eager, (x, zero))
                 for _ in range(3):
-                    torch.testing.assert_allclose(
+                    torch.testing.assert_close(
                         script(x, zero),
                         eager(x, zero))
-                    torch.testing.assert_allclose(
+                    torch.testing.assert_close(
                         script(x, one),
                         eager(x, one))
                 self.assertAllFused(script.graph_for(x, one))
@@ -1830,7 +1852,7 @@ class TestTEFuser(JitTestCase):
                 xs -= 0.1 * xs.grad
                 x.grad = None
                 xs.grad = None
-        torch.testing.assert_allclose(y, ys)
+        torch.testing.assert_close(y, ys)
 
     def test_relu_fwd_bwd(self):
         def eager(x):
@@ -1913,12 +1935,48 @@ class TestTEFuser(JitTestCase):
             for _ in range(3):
                 script(x)
 
-            torch.testing.assert_allclose(eager(x), script(x))
+            torch.testing.assert_close(eager(x), script(x))
 
             # Now when an input hits the unrolled path, it will produce an
             # incorrectly-sized tensor, since size=1 has been burned in.
             x = torch.ones((8, 1))
-            torch.testing.assert_allclose(eager(x), script(x))
+            torch.testing.assert_close(eager(x), script(x))
+
+    def test_batch_norm(self):
+        def test(fn, args):
+            trace = torch.jit.trace(fn, args)
+            self.assertAllFused(trace.graph_for(*args))
+            torch.testing.assert_allclose(fn(*args), trace(*args))
+
+        def bn(i, x):
+            return torch.batch_norm(i, x, x, x, x, False, 0.1, 1e-4, False).relu()
+
+        def bn_no_weight(i, x):
+            return torch.batch_norm(i, None, x, x, x, False, 0.1, 1e-4, False).relu()
+
+        def bn_no_bias(i, x):
+            return torch.batch_norm(i, x, None, x, x, False, 0.1, 1e-4, False).relu()
+
+        def bn_neither(i, x):
+            return torch.batch_norm(i, None, None, x, x, False, 0.1, 1e-4, False).relu()
+
+        for device in self.devices:
+            i = torch.randn(4, 16, 32, 40, device=device)
+            x = torch.randn(16, device=device)
+            for fn in [bn, bn_no_weight, bn_no_bias, bn_neither]:
+                test(fn, (i, x))
+
+    def test_profiler(self):
+        @torch.jit.script
+        def test(x, y, z):
+            return x * y + z
+
+        args = [torch.randn(4) for _ in range(3)]
+        with torch.autograd.profiler.profile() as prof:
+            for _ in range(3):
+                test(*args)
+        self.assertIn("fused_mul_add", prof.table())
+
 
 works_list = [
     '__radd__',
@@ -1936,10 +1994,13 @@ works_list = [
     'ceil',
     'clamp',
     'clamp.scalar',
+    'contiguous',
     'cos',
     'cosh',
     'div.no_rounding_mode',
     'div.true_rounding',
+    'div.floor_rounding',
+    'div.trunc_rounding',
     'eq',
     'erf',
     'erfc',
@@ -1952,6 +2013,7 @@ works_list = [
     'fmod.autodiffed',
     'ge',
     'gt',
+    'isnan',
     'le',
     'lerp',
     'lgamma',
@@ -1972,23 +2034,33 @@ works_list = [
     'nn.functional.hardshrink',
     'nn.functional.hardsigmoid',
     'nn.functional.hardswish',
+    'nn.functional.softplus',
     'nn.functional.hardtanh',
     'nn.functional.leaky_relu',
+    'nn.functional.relu',
     'nn.functional.relu6',
+    'nn.functional.softsign',
+    'nn.functional.tanhshrink',
+    'nn.functional.threshold',
     'permute',
     'pow',
     'reciprocal',
     'remainder',
     'remainder.autodiffed',
     'reshape',
+    'reshape_as',
     'round',
+    'rsub',
+    'rsub.rsub_tensor',
     'rsqrt',
     'sigmoid',
+    'sign',
     'sin',
     'sinh',
     'sqrt',
     'sub',
     'sum',
+    't',
     'tan',
     'tanh',
     'transpose',
@@ -1996,7 +2068,26 @@ works_list = [
     'trunc',
     'unsqueeze',
     'view',
+    'view_as',
     'where',
+    'bool',
+    'byte',
+    'char',
+    'double',
+    'float',
+    'half',
+    'int',
+    'long',
+    'short',
+    'bool.channels_last',
+    'byte.channels_last',
+    'char.channels_last',
+    'double.channels_last',
+    'float.channels_last',
+    'half.channels_last',
+    'int.channels_last',
+    'long.channels_last',
+    'short.channels_last',
 ]
 
 known_failures = [
@@ -2007,9 +2098,6 @@ known_failures = [
 
 # If your OpInfo test causes this test to fail, add it here
 skip_ops = [
-    # Causing SIGSEGV
-    # Reference: https://github.com/pytorch/pytorch/pull/59442/checks?check_run_id=2746156896
-    't',
     'conj'
 ]
 
@@ -2021,8 +2109,6 @@ def get_name(op):
 
 class TestNNCOpInfo(TestCase):
     def te_compile(self, device, dtype, op):
-        # If adding new OpInfo tests cause this test to fail, add it into here
-        skip_ops = []
         if op.name in skip_ops:
             return
         sample_inputs_itr = op.sample_inputs(device, dtype, requires_grad=False)
@@ -2087,7 +2173,9 @@ def f({', '.join(param_names)}):
         if get_name(op) in skip_ops:
             return
         try:
-            self.te_compile(device, dtype, op)
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', TracerWarning)
+                self.te_compile(device, dtype, op)
         except Exception as e:
             pass
         else:
@@ -2096,6 +2184,69 @@ def f({', '.join(param_names)}):
 
 only_for = ("cpu", "cuda")
 instantiate_device_type_tests(TestNNCOpInfo, globals(), only_for=only_for)
+
+
+class TestLoopnestRandomization(JitTestCase):
+    def setUp(self):
+        self.old_cpu_fuser_state = torch._C._jit_can_fuse_on_cpu()
+        self.old_must_use_cpu_state = torch._C._jit_get_te_must_use_llvm_cpu()
+        self.old_gpu_fuser_state = torch._C._jit_can_fuse_on_gpu()
+
+        torch._C._jit_override_can_fuse_on_cpu(True)
+        # TODO: force LLVM. need to add it to asan, mac, windows builds + sandcastle
+        # torch._C._jit_set_te_must_use_llvm_cpu(True)
+        torch._C._jit_override_can_fuse_on_gpu(True)
+
+        self.old_profiling_executor = torch._C._jit_set_profiling_executor(True)
+        self.old_profiling_mode = torch._C._jit_set_profiling_mode(True)
+
+        self.old_fusion_inlining = torch._C._debug_get_fusion_group_inlining()
+        torch._C._debug_set_fusion_group_inlining(False)
+
+        self.texpr_fuser_state = torch._C._jit_texpr_fuser_enabled()
+        torch._C._jit_set_texpr_fuser_enabled(True)
+
+        self.old_te_must_use_llvm_cpu = torch._C._jit_get_te_must_use_llvm_cpu()
+        torch._C._jit_set_te_must_use_llvm_cpu(False)
+
+        # Set the seed to 1. This tests the codepath through random
+        # transformation.
+        os.environ["PYTORCH_TENSOREXPR_RANDOM_TRANSFORM_SEED"] = "1"
+
+    def tearDown(self):
+        torch._C._jit_set_profiling_executor(self.old_profiling_executor)
+        torch._C._jit_set_profiling_mode(self.old_profiling_mode)
+
+        torch._C._jit_override_can_fuse_on_gpu(self.old_gpu_fuser_state)
+        torch._C._jit_override_can_fuse_on_cpu(self.old_cpu_fuser_state)
+        torch._C._jit_set_te_must_use_llvm_cpu(self.old_must_use_cpu_state)
+        torch._C._debug_set_fusion_group_inlining(self.old_fusion_inlining)
+
+        torch._C._jit_set_texpr_fuser_enabled(self.texpr_fuser_state)
+        torch._C._jit_set_te_must_use_llvm_cpu(self.old_te_must_use_llvm_cpu)
+
+        # Set it back to 0.
+        os.environ["PYTORCH_TENSOREXPR_RANDOM_TRANSFORM_SEED"] = "0"
+
+    @onlyCPU
+    @unittest.skipIf(not LLVM_ENABLED, "Compiles with TensorExprKernel")
+    def test_relu(self, device):
+        def fn_test_relu(x, y):
+            return F.relu(x + 0.5 * y)
+
+        x = torch.randn(4, 4, dtype=torch.float, device=device)
+        y = torch.randn(4, 4, dtype=torch.float, device=device)
+
+        fn = fn_test_relu
+        traced_fn = torch.jit.trace(fn, (x, y))
+
+        ref = fn(x, y)
+        res = traced_fn(x, y)
+        assert torch.allclose(ref, res)
+
+
+instantiate_device_type_tests(TestLoopnestRandomization, globals(), only_for=("cpu"))
+
 
 if __name__ == '__main__':
     run_tests()

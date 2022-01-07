@@ -5,6 +5,7 @@
 #include <ATen/ATen.h>
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <ATen/vulkan/Context.h>
+#include <c10/util/irange.h>
 
 bool checkRtol(const at::Tensor& diff, const std::vector<at::Tensor> inputs) {
   double maxValue = 0.0;
@@ -21,7 +22,6 @@ bool exactlyEqual(const at::Tensor& a, const at::Tensor& b) {
   return (a - b).abs().max().item<float>() == 0.f;
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, ToVulkanToCpu) {
   if (!at::is_vulkan_available())
     return;
@@ -34,7 +34,6 @@ TEST(VulkanTest, ToVulkanToCpu) {
   ASSERT_TRUE(almostEqual(t2, t));
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, upsampleNearest2D) {
   if (!at::is_vulkan_available())
     return;
@@ -57,7 +56,6 @@ TEST(VulkanTest, upsampleNearest2D) {
   ASSERT_TRUE(check);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, add) {
   if (!at::is_vulkan_available())
     return;
@@ -72,7 +70,6 @@ TEST(VulkanTest, add) {
   ASSERT_TRUE(almostEqual(t_out, t_out_expected));
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, add_not4dim) {
   if (!at::is_vulkan_available())
     return;
@@ -87,7 +84,6 @@ TEST(VulkanTest, add_not4dim) {
   ASSERT_TRUE(almostEqual(t_out, t_out_expected));
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, add_cpu_vulkan) {
   if (!at::is_vulkan_available())
     return;
@@ -107,7 +103,6 @@ TEST(VulkanTest, add_cpu_vulkan) {
   ASSERT_TRUE(almostEqual(t_out2, t_out_expected));
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, add_) {
   if (!at::is_vulkan_available())
     return;
@@ -127,7 +122,6 @@ TEST(VulkanTest, add_) {
   ASSERT_TRUE(check);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, mulScalar) {
   if (!at::is_vulkan_available())
     return;
@@ -146,14 +140,13 @@ TEST(VulkanTest, mulScalar) {
   ASSERT_TRUE(check);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, addScalar) {
   if (!at::is_vulkan_available())
     return;
   auto t_in = at::rand({3, 2, 2, 3}, at::device(at::kCPU).dtype(at::kFloat));
   float* data = t_in.data_ptr<float>();
   auto numel = t_in.numel();
-  for (int i = 0; i < numel; i++) {
+  for (const auto i : c10::irange(numel)) {
     // NOLINTNEXTLINE(bugprone-narrowing-conversions,cppcoreguidelines-narrowing-conversions)
     data[i] = i;
   }
@@ -173,7 +166,6 @@ TEST(VulkanTest, addScalar) {
   ASSERT_TRUE(check);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, conv2d) {
   if (!at::is_vulkan_available())
     return;
@@ -204,7 +196,6 @@ TEST(VulkanTest, conv2d) {
   ASSERT_TRUE(check);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, conv2dDWWeightsOnCPU) {
   if (!at::is_vulkan_available())
     return;
@@ -234,7 +225,6 @@ TEST(VulkanTest, conv2dDWWeightsOnCPU) {
   ASSERT_TRUE(check);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, addmm) {
   if (!at::is_vulkan_available())
     return;
@@ -259,7 +249,6 @@ TEST(VulkanTest, addmm) {
   ASSERT_TRUE(check);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, mm) {
   if (!at::is_vulkan_available())
     return;
@@ -280,7 +269,6 @@ TEST(VulkanTest, mm) {
   ASSERT_TRUE(check);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, clamp) {
   if (!at::is_vulkan_available())
     return;
@@ -296,7 +284,6 @@ TEST(VulkanTest, clamp) {
   ASSERT_TRUE(almostEqual(t_out, t_out_expected));
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, hardtanh_) {
   if (!at::is_vulkan_available())
     return;
@@ -312,7 +299,6 @@ TEST(VulkanTest, hardtanh_) {
   ASSERT_TRUE(almostEqual(t_out, t_out_expected));
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, relu_) {
   if (!at::is_vulkan_available())
     return;
@@ -331,7 +317,6 @@ TEST(VulkanTest, relu_) {
   ASSERT_TRUE(check);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, mean) {
   if (!at::is_vulkan_available())
     return;
@@ -436,8 +421,7 @@ class Conv2d : public BaseOp {
 
 class OpsList {
  public:
-  // NOLINTNEXTLINE(modernize-use-equals-default)
-  OpsList() {}
+  OpsList() = default;
   OpsList(std::vector<std::unique_ptr<BaseOp>>& _ops) : ops(std::move(_ops)) {}
 
   auto runDual(at::Tensor& in, at::Tensor& vin) {
@@ -568,7 +552,6 @@ class MobileNetV2 : public OpsList {
   }
 };
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, DISABLED_mobilenetv2) {
   if (!at::is_vulkan_available())
     return;
@@ -580,7 +563,6 @@ TEST(VulkanTest, DISABLED_mobilenetv2) {
   mn2.runDual(t_in, tv_in);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, OpsList) {
   if (!at::is_vulkan_available())
     return;
@@ -638,7 +620,6 @@ inline std::vector<c10::IValue> callOpByName(
   return callOpByHandle(op_handle.value(), std::forward<Args>(args)...);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, conv2dPrepack) {
   if (!at::is_vulkan_available())
     return;
@@ -695,7 +676,6 @@ TEST(VulkanTest, conv2dPrepack) {
   ASSERT_TRUE(prepack_check);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, adaptive_avg_pool2d) {
   if (!at::is_vulkan_available())
     return;
@@ -717,7 +697,6 @@ TEST(VulkanTest, adaptive_avg_pool2d) {
 }
 
 // TODO: Enable when view operator for Vulkan landed
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, DISABLED_adaptive_avg_pool2d_2) {
   if (!at::is_vulkan_available())
     return;
@@ -738,7 +717,6 @@ TEST(VulkanTest, DISABLED_adaptive_avg_pool2d_2) {
   ASSERT_TRUE(check);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, reshape) {
   if (!at::is_vulkan_available())
     return;
@@ -758,7 +736,6 @@ TEST(VulkanTest, reshape) {
   ASSERT_TRUE(check);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, reshape2) {
   if (!at::is_vulkan_available())
     return;
@@ -779,7 +756,6 @@ TEST(VulkanTest, reshape2) {
   ASSERT_TRUE(check);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, tensor5d) {
   if (!at::is_vulkan_available())
     return;
@@ -789,7 +765,6 @@ TEST(VulkanTest, tensor5d) {
   auto tv_in = t_in.vulkan();
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, tensor5d_transpose) {
   if (!at::is_vulkan_available())
     return;
@@ -798,7 +773,7 @@ TEST(VulkanTest, tensor5d_transpose) {
       at::empty({1, 2, 3, 2, 1}, at::TensorOptions(at::kCPU).dtype(at::kFloat));
   float* data = t_in.data_ptr<float>();
   auto numel = t_in.numel();
-  for (int i = 0; i < numel; i++) {
+  for (const auto i : c10::irange(numel)) {
     // NOLINTNEXTLINE(bugprone-narrowing-conversions,cppcoreguidelines-narrowing-conversions)
     data[i] = i;
   }
@@ -815,7 +790,6 @@ TEST(VulkanTest, tensor5d_transpose) {
   ASSERT_TRUE(check);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, view) {
   if (!at::is_vulkan_available())
     return;
@@ -835,7 +809,6 @@ TEST(VulkanTest, view) {
   ASSERT_TRUE(check);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, slice) {
   if (!at::is_vulkan_available())
     return;
@@ -844,7 +817,7 @@ TEST(VulkanTest, slice) {
       at::empty({1, 4, 2, 2}, at::TensorOptions(at::kCPU).dtype(at::kFloat));
   float* data = t_in.data_ptr<float>();
   auto numel = t_in.numel();
-  for (int i = 0; i < numel; i++) {
+  for (const auto i : c10::irange(numel)) {
     // NOLINTNEXTLINE(bugprone-narrowing-conversions,cppcoreguidelines-narrowing-conversions)
     data[i] = i;
   }
@@ -861,7 +834,6 @@ TEST(VulkanTest, slice) {
   ASSERT_TRUE(check);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, select) {
   if (!at::is_vulkan_available())
     return;
@@ -870,7 +842,7 @@ TEST(VulkanTest, select) {
       at::empty({1, 4, 2, 2}, at::TensorOptions(at::kCPU).dtype(at::kFloat));
   float* data = t_in.data_ptr<float>();
   auto numel = t_in.numel();
-  for (int i = 0; i < numel; i++) {
+  for (const auto i : c10::irange(numel)) {
     // NOLINTNEXTLINE(bugprone-narrowing-conversions,cppcoreguidelines-narrowing-conversions)
     data[i] = i;
   }
@@ -887,7 +859,6 @@ TEST(VulkanTest, select) {
   ASSERT_TRUE(check);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, unsqueeze) {
   if (!at::is_vulkan_available())
     return;
@@ -896,7 +867,7 @@ TEST(VulkanTest, unsqueeze) {
       at::empty({1, 2, 2}, at::TensorOptions(at::kCPU).dtype(at::kFloat));
   float* data = t_in.data_ptr<float>();
   auto numel = t_in.numel();
-  for (int i = 0; i < numel; i++) {
+  for (const auto i : c10::irange(numel)) {
     // NOLINTNEXTLINE(bugprone-narrowing-conversions,cppcoreguidelines-narrowing-conversions)
     data[i] = i;
   }
@@ -913,7 +884,6 @@ TEST(VulkanTest, unsqueeze) {
   ASSERT_TRUE(check);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, cat) {
   if (!at::is_vulkan_available())
     return;
@@ -937,7 +907,6 @@ TEST(VulkanTest, cat) {
   ASSERT_TRUE(check);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, DISABLED_max_pool2d) {
   if (!at::is_vulkan_available())
     return;
@@ -958,7 +927,6 @@ TEST(VulkanTest, DISABLED_max_pool2d) {
   ASSERT_TRUE(check);
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 TEST(VulkanTest, avg_pool2d) {
   if (!at::is_vulkan_available())
     return;
